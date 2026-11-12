@@ -3,6 +3,16 @@ RELAY ASSESSMENT — TROUBLESHOOTING & ENGINEERING WALKTHROUGH
 Purpose Use this document to explain the main problems found during the
 assessment, how they were diagnosed, what was changed, and why.
 
+
+How the application works
+1. Incoming request: A client sends an event to POST /events, including an Idempotency-Key header and a JSON payload.
+2. Request processing: The Express.js API receives the request, generates an event ID, and calculates an HMAC-SHA256 signature using the configured signing secret.
+3. Duplicate protection: PostgreSQL stores the event and its idempotency key. A unique constraint prevents the same key from being processed as a new event twice. A replay receives HTTP 409 and the existing event ID.
+4. Archiving: After a successful database insert, the application archives the payload to Amazon S3.
+5. Health checks: Kubernetes calls /health to check whether the application and its database dependency are healthy.
+6. Deployment and scaling: Kubernetes runs the application in pods, exposes it through a Service, and uses an HPA configured to scale based on CPU utilization.
+
+
 1.  Application and Kubernetes port mismatch Problem: The application
     and Kubernetes resources were not consistently configured for the
     required port 8080. Diagnosis: Compared the application’s PORT
