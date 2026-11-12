@@ -1,0 +1,149 @@
+RELAY ASSESSMENT — TROUBLESHOOTING & ENGINEERING WALKTHROUGH
+
+Purpose Use this document to explain the main problems found during the
+assessment, how they were diagnosed, what was changed, and why.
+
+1.  Application and Kubernetes port mismatch Problem: The application
+    and Kubernetes resources were not consistently configured for the
+    required port 8080. Diagnosis: Compared the application’s PORT
+    setting, containerPort, Service targetPort, and health-probe
+    configuration. Resolution: Aligned the application and Kubernetes
+    configuration to port 8080. Updated health probes to call /health on
+    port 8080 and the Service to target the correct container port. Why:
+    The application, Service, and probes must agree for traffic routing
+    and pod health checks to work.
+
+2.  PostgreSQL Secret key mismatch Problem: The Deployment referenced
+    database-url while the Secret exposed DATABASE_URL. Diagnosis:
+    Compared the Secret definition with the Deployment’s secretKeyRef.
+    Resolution: Updated the Deployment to reference DATABASE_URL. Why:
+    Secret references are exact and case-sensitive.
+
+3.  Kind image pull failure Problem: The pod entered ImagePullBackOff
+    because the locally built image was not available inside the Kind
+    cluster. Diagnosis: Confirmed the image existed locally but was
+    unavailable to the Kind node. Resolution: kind load docker-image
+    relay:latest –name relay Set imagePullPolicy to IfNotPresent for the
+    local assessment environment. Why: Kind runs Kubernetes nodes in
+    containers; a local image must be loaded into the cluster or pulled
+    from a registry.
+
+4.  PostgreSQL connection timeouts under load Problem: The initial 150
+    RPS test, with the application pool set to 5, produced HTTP 500
+    responses and ECONNRESET errors. Application logs showed database
+    connection acquisition timeouts. Diagnosis: Correlated load-test
+    failures with the application’s connection timeout logs. PostgreSQL
+    logs did not show a corresponding database failure. Resolution:
+    Increased PG_POOL_MAX from 5 to 8 and repeated the tests. The
+    subsequent 150 RPS and 400 RPS runs completed without reported
+    transport errors or HTTP 500 responses. Why: The application needed
+    sufficient database connections for concurrent requests. Pool sizing
+    must still respect the database-wide connection limit across all
+    replicas and other clients.
+
+5.  In-memory idempotency was not safe for multiple replicas Problem: An
+    in-memory Map only tracks keys inside one process. With multiple
+    pods, the same request could reach different pods and be processed
+    more than once. Diagnosis: Reviewed the request-handling path and
+    identified that deduplication state was local to each process.
+    Resolution: Moved idempotency enforcement to PostgreSQL. The
+    application inserts using the unique idempotency key and ON CONFLICT
+    DO NOTHING. If the key already exists, it returns HTTP 409 with the
+    existing event ID. Why: The database unique constraint provides a
+    shared, atomic source of truth across replicas. HTTP 409 is the
+    expected response for a replayed request.
+
+6.  HPA metrics unavailable in Kind Problem: The Horizontal Pod
+    Autoscaler displayed unknown CPU utilization because the Metrics API
+    was unavailable. Diagnosis: Checked HPA status and ran kubectl top
+    pods; the Metrics API was unavailable. Resolution: Recorded this as
+    an environment limitation. Did not claim horizontal autoscaling had
+    been verified. Why: CPU-based HPA decisions require metrics. A
+    configured HPA alone does not prove scaling works.
+
+7.  Docker image hardening Problem: The original container configuration
+    did not sufficiently limit the build context or run the application
+    as a non-root user. Resolution: Added app/.dockerignore to exclude
+    environment files, dependencies, logs, and Git metadata. Updated the
+    Dockerfile to install production dependencies, copy files with
+    appropriate ownership, run as the node user, and set a smaller
+    Node.js heap limit. Verification: The Docker image build completed
+    successfully. A successful build does not by itself prove the
+    updated image has been rolled out and tested in Kubernetes. Why: A
+    smaller build context reduces accidental inclusion of sensitive or
+    unnecessary files. Running as non-root reduces container privileges.
+
+8.  Git and environment-file hygiene Problem: The application
+    environment file was tracked by Git. Resolution: Removed app/.env
+    from the repository and added environment-file patterns to
+    .gitignore. The assessment commit shows app/.env deleted. Why:
+    Environment files can contain credentials. Ignore rules do not erase
+    secrets from earlier Git history; rotate any real credentials that
+    were committed.
+
+LOAD-TEST EVIDENCE
+
+The local Kind tests used approximately 8 KB payloads and 5% replay
+traffic.
+
+Initial 150 RPS test, pool size 5: total: sent=4494 status[201:4188
+409:238 500:48] errors[ECONNRESET:20] p50=95ms p95=2489ms p99=3128ms
+
+150 RPS after pool adjustment to 8: total: sent=4494 status[201:4254
+409:240] errors[-] p50=9ms p95=387ms p99=730ms
+
+400 RPS after pool adjustment to 8: total: sent=11992 status[201:11437
+409:555] errors[-] p50=12ms p95=455ms p99=859ms
+
+How to explain: The first test exposed database connection acquisition
+timeouts. After increasing the pool, both target rates completed without
+reported HTTP 500 or transport errors. HTTP 409 responses were expected
+duplicate/replay responses. These were short local tests, not proof of
+sustained production capacity.
+
+IMPORTANT PRODUCTION RISKS TO ACKNOWLEDGE
+
+-   PostgreSQL uses ephemeral EmptyDir storage in the supplied
+    Kubernetes setup. Data can be lost when the pod is replaced.
+-   HPA scaling was not verified because Kind did not provide metrics.
+-   Database migrations run at application container startup, so
+    multiple replicas could attempt migrations concurrently.
+-   If S3 archival fails after the database insert succeeds, a retry may
+    be treated as a duplicate without retrying the archive. A durable
+    outbox/retry design is still needed.
+-   Terraform review identified broad IAM permissions, public management
+    access, missing HTTPS/TLS configuration, storage encryption gaps,
+    and a mismatch between the ALB target port and worker security-group
+    ingress.
+-   The Kubernetes Secret manifest contains credentials and is not a
+    secure production secret-management solution. Use an external secret
+    manager and do not commit production secrets.
+-   Terraform was reviewed only. No infrastructure was applied.
+-   k8s/postgres.yaml was treated as out of scope.
+
+SUGGESTED WALKTHROUGH
+
+“I started by checking whether the application configuration matched
+Kubernetes. I corrected the port and health-probe settings, then fixed a
+Secret key mismatch that prevented the database connection string from
+being injected.
+
+The local Kind cluster could not initially access the image built on my
+machine, so I loaded the image into Kind and used IfNotPresent for the
+local test environment.
+
+The first load test exposed database connection acquisition timeouts
+with a pool size of five. I increased the pool to eight and reran the
+tests at both 150 and 400 requests per second. Those runs completed
+without HTTP 500 responses or transport errors.
+
+I also replaced process-local idempotency with a PostgreSQL
+unique-constraint approach. This matters because in-memory state is not
+shared between replicas. Replayed requests now return HTTP 409 with the
+original event ID.
+
+I did not claim HPA scaling was verified because the local cluster had
+no Metrics API. I reviewed Terraform without applying infrastructure. My
+recommendation remains DO NOT SHIP until the production risks around
+durable database storage, migration orchestration, S3 retry handling,
+IAM, network exposure, TLS, and secret management are addressed.”
