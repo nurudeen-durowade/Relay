@@ -28,22 +28,6 @@ function logRequest(req, res, startedAt) {
     }) + '\n',
   );
 }
-
-// ------------------------------------------------------------ idempotency
-
-// Clients retry with the same Idempotency-Key. Replays are answered from
-// memory so a retry storm never reaches the database.
-const seen = new Map();
-
-function remember(key, entry) {
-  seen.set(key, entry);
-  if (config.dedupeMaxEntries > 0 && seen.size > config.dedupeMaxEntries) {
-    seen.delete(seen.keys().next().value);
-  }
-}
-
-// ---------------------------------------------------------------- archive
-
 let s3 = null;
 
 async function archive(id, payload) {
@@ -82,37 +66,57 @@ app.get('/health', async (req, res) => {
   }
 });
 
+
 app.post('/events', async (req, res) => {
   const key = req.get('Idempotency-Key');
-  if (!key) {
-    return res.status(400).json({ error: 'Idempotency-Key header is required' });
-  }
 
-  const previous = seen.get(key);
-  if (previous) {
-    return res.status(409).json({ id: previous.id, duplicate: true });
+  if (!key) {
+    return res.status(400).json({
+      error: 'Idempotency-Key header is required',
+    });
   }
 
   const id = crypto.randomUUID();
   const payload = req.body;
+
   const signature = crypto
     .createHmac('sha256', config.signingSecret)
     .update(JSON.stringify(payload))
     .digest('hex');
 
   try {
-    await pool.query(
-      'INSERT INTO events (id, idempotency_key, payload, signature) VALUES ($1, $2, $3, $4)',
+    const result = await pool.query(
+      `INSERT INTO events (id, idempotency_key, payload, signature)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (idempotency_key) DO NOTHING
+       RETURNING id`,
       [id, key, payload, signature],
     );
-    remember(key, { id, payload, signature });
+
+    if (result.rowCount === 0) {
+      const existing = await pool.query(
+        'SELECT id FROM events WHERE idempotency_key = $1',
+        [key],
+      );
+
+      return res.status(409).json({
+        id: existing.rows[0]?.id,
+        duplicate: true,
+      });
+    }
+
     await archive(id, payload);
-    res.status(201).json({ id, signature });
+
+    return res.status(201).json({ id, signature });
   } catch (err) {
     console.error('failed to store event:', err.message);
-    res.status(500).json({ error: 'internal error' });
+
+    return res.status(500).json({
+      error: 'internal error',
+    });
   }
 });
+
 
 app.get('/events/:id', async (req, res) => {
   try {

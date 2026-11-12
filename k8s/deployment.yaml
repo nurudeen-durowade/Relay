@@ -25,8 +25,9 @@ spec:
       containers:
         - name: relay
           image: relay:latest
+          imagePullPolicy: IfNotPresent
           ports:
-            - containerPort: 3000
+            - containerPort: 8080  #fix port to match application
           envFrom:
             - configMapRef:
                 name: relay-config
@@ -35,7 +36,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: relay-secrets
-                  key: database-url
+                  key: DATABASE_URL #fix key name mismatch
             - name: SIGNING_SECRET
               valueFrom:
                 secretKeyRef:
@@ -44,11 +45,23 @@ spec:
           livenessProbe:
             httpGet:
               path: /health
-              port: 3000
+              port: 8080 #fix port to match application
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080 #fix port to match application
             initialDelaySeconds: 5
             periodSeconds: 5
-            timeoutSeconds: 1
-            failureThreshold: 2
+            timeoutSeconds: 3
+            failureThreshold: 3
           resources:
             limits:
+              cpu: 500m
               memory: 256Mi
+            requests:
+              memory: 128Mi
+              cpu: 100m

@@ -5,5 +5,6 @@ metadata:
   namespace: relay
 data:
   PORT: "8080"
-  PG_POOL_MAX: "25"
+  PG_POOL_MAX: "8" #Change PostgreSQL pool max connections to '8' because 25 x 10 max replicas at high peak can cause timeout issues, leading to potential connection saturation and timeouts.
+  # Consider reducing this value to '8' to prevent overwhelming the database under high load scenarios.
   LOG_FILE: /var/log/relay/access.log
